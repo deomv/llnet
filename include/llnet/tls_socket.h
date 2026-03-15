@@ -9,11 +9,11 @@
 #include <unistd.h>
 
 #ifdef USE_WOLFSSL
+#include <wolfssl/options.h>
+#include <wolfssl/ssl.h>
 #include <wolfssl/openssl/bio.h>
 #include <wolfssl/openssl/err.h>
 #include <wolfssl/openssl/ssl.h>
-#include <wolfssl/options.h>
-#include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #else
 #include <openssl/bio.h>
@@ -31,7 +31,6 @@
 #include <cstring>
 #include <span>
 #include <string>
-#include <vector>
 
 namespace llnet
 {
@@ -39,6 +38,11 @@ namespace llnet
   // TlsSocket — non-blocking TCP + TLS client stream.
   //
   // I/O events dispatched by EpollLoop. WsSocket sits on top.
+  //
+  // send_raw() is zero-copy on the fast path: data is written directly to
+  // SSL_write from the caller's buffer. A small overflow queue (plain_buf_,
+  // kSendCap bytes, pre-allocated) is used only when SSL returns WANT_WRITE —
+  // rare on memory-BIO setups and effectively never on healthy connections.
   //
   // Errors are reported by returning false / calling on_disconnect,
   // and optionally via the LogFn passed at construction.
@@ -56,11 +60,17 @@ namespace llnet
 
     explicit TlsSocket(LogFn log = noop_log) noexcept : log_{log}
     {
-      recv_buf_ = static_cast<char*>(std::aligned_alloc(64, kRecvCap));
-      send_buf_ = static_cast<char*>(std::aligned_alloc(64, kSendCap));
-      raw_buf_  = static_cast<char*>(std::aligned_alloc(64, kRawCap));
-      SSL_library_init();
-      ssl_ctx_ = SSL_CTX_new(SSLv23_client_method());
+      recv_buf_  = static_cast<char*>(std::aligned_alloc(64, kRecvCap));
+      send_buf_  = static_cast<char*>(std::aligned_alloc(64, kSendCap));
+      raw_buf_   = static_cast<char*>(std::aligned_alloc(64, kRawCap));
+      plain_buf_ = static_cast<char*>(std::aligned_alloc(64, kSendCap));
+      if (!recv_buf_ || !send_buf_ || !raw_buf_ || !plain_buf_)
+        log_("[llnet::TlsSocket] buffer allocation failed");
+      // SSL_library_init is a no-op in OpenSSL 1.1+ / modern wolfSSL, but call
+      // it once for compatibility with older builds.
+      static bool ssl_init_done = false;
+      if (!ssl_init_done) { SSL_library_init(); ssl_init_done = true; }
+      ssl_ctx_ = SSL_CTX_new(TLS_client_method());
 #ifdef USE_WOLFSSL
       if (ssl_ctx_)
       {
@@ -74,12 +84,11 @@ namespace llnet
     {
       cleanup_conn();
       if (ssl_ctx_)
-      {
         SSL_CTX_free(ssl_ctx_);
-      }
       std::free(recv_buf_);
       std::free(send_buf_);
       std::free(raw_buf_);
+      std::free(plain_buf_);
     }
 
     TlsSocket(const TlsSocket&)            = delete;
@@ -150,6 +159,8 @@ namespace llnet
     // Non-blocking connect using pre-resolved address.
     [[nodiscard]] bool connect()
     {
+      if (!recv_buf_ || !send_buf_ || !raw_buf_ || !plain_buf_)
+      { log_("[llnet::TlsSocket] connect() with failed buffer allocation"); return false; }
       if (peer_addr_len_ == 0) { log_("[llnet::TlsSocket] connect() before resolve()"); return false; }
       if (!io_svc_)            { log_("[llnet::TlsSocket] connect() before set_io_service()"); return false; }
       ensure_cas_loaded();
@@ -174,19 +185,40 @@ namespace llnet
     void disconnect() noexcept { cleanup_conn(); }
     [[nodiscard]] bool is_connected() const noexcept { return state_ == State::Connected; }
 
+    // Zero-copy on the fast path: data is passed directly to SSL_write from the
+    // caller's buffer. Only falls back to the overflow queue (plain_buf_) if
+    // SSL returns WANT_WRITE or there is already queued data — both rare.
     [[nodiscard]] bool send_raw(std::span<const char> data)
     {
       if (state_ != State::Connected) return false;
-      if (plain_buf_.size() - plain_off_ + data.size() > kRecvCap)
+
+      // Fast path: overflow queue empty — write directly from caller's buffer.
+      if (plain_off_ == plain_len_)
       {
-        log_("[llnet::TlsSocket] plaintext send queue overflow");
+        size_t wrote = 0;
+        if (tls_write_some(data.data(), data.size(), wrote) == TlsWriteResult::Error)
+          return false;
+        flush_send();
+        if (state_ != State::Connected) return false;
+        data = data.subspan(wrote);
+        if (data.empty()) return true;
+        // SSL WANT_WRITE: buffer the unsent remainder below.
+      }
+
+      // Slow path: queue remainder for retry on next EPOLLOUT.
+      if (plain_off_ > 0)
+      {
+        std::memmove(plain_buf_, plain_buf_ + plain_off_, plain_len_ - plain_off_);
+        plain_len_ -= plain_off_;
+        plain_off_  = 0;
+      }
+      if (plain_len_ + data.size() > kSendCap)
+      {
+        log_("[llnet::TlsSocket] plaintext overflow queue full");
         return false;
       }
-      if (plain_off_ == plain_buf_.size()) { plain_buf_.clear(); plain_off_ = 0; }
-      plain_buf_.insert(plain_buf_.end(), data.begin(), data.end());
-      if (!flush_plain_send()) return false;
-      if (state_ != State::Connected) return false;
-      flush_send();
+      std::memcpy(plain_buf_ + plain_len_, data.data(), data.size());
+      plain_len_ += data.size();
       return true;
     }
 
@@ -232,7 +264,7 @@ namespace llnet
       {
         SSL_shutdown(ssl_);
         SSL_free(ssl_);
-        ssl_  = nullptr;
+        ssl_   = nullptr;
         bio_r_ = nullptr;
         bio_w_ = nullptr;
       }
@@ -242,10 +274,9 @@ namespace llnet
         ::close(sockfd_);
         sockfd_ = -1;
       }
-      state_    = State::Disconnected;
-      recv_len_ = send_len_ = send_off_ = raw_len_ = 0;
-      plain_buf_.clear();
-      plain_off_ = 0;
+      state_     = State::Disconnected;
+      recv_len_  = send_len_ = send_off_ = raw_len_ = 0;
+      plain_len_ = plain_off_ = 0;
     }
 
     void on_sock_error()
@@ -259,6 +290,9 @@ namespace llnet
     // ── TLS ──────────────────────────────────────────────────────────────────
 
 #ifdef USE_WOLFSSL
+    // Allows cross-signed intermediate CAs (e.g. Let's Encrypt R3 cross-signed
+    // by DST Root X3). Accepts specific issuer-lookup failures at depth > 0
+    // only; the leaf certificate is still fully verified.
     static int cross_cert_cb(int preverify_ok, WOLFSSL_X509_STORE_CTX* store)
     {
       if (preverify_ok) return 1;
@@ -276,7 +310,7 @@ namespace llnet
     void ensure_cas_loaded()
     {
       if (cas_loaded_) return;
-      cas_loaded_ = true;
+      cas_loaded_ = true;  // attempt once regardless of outcome
 
       bool loaded = false;
       if (!ca_file_.empty())
@@ -304,6 +338,9 @@ namespace llnet
         }
       }
 
+      if (!loaded && verify_peer_)
+        log_("[llnet::TlsSocket] CA certificates failed to load — peer verification may fail");
+
       if (verify_peer_)
       {
 #ifdef USE_WOLFSSL
@@ -316,18 +353,24 @@ namespace llnet
       {
         SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_NONE, nullptr);
       }
-      (void)loaded;
     }
 
     bool setup_tls()
     {
-      ssl_  = SSL_new(ssl_ctx_);
+      ssl_   = SSL_new(ssl_ctx_);
       bio_r_ = BIO_new(BIO_s_mem());
       bio_w_ = BIO_new(BIO_s_mem());
       if (!ssl_ || !bio_r_ || !bio_w_) return false;
       SSL_set_bio(ssl_, bio_r_, bio_w_);
       SSL_set_connect_state(ssl_);
+#ifdef USE_WOLFSSL
+      // wolfSSL_set_tlsext_host_name is conditionally exported; call the
+      // native SNI API it wraps, which is unconditionally available.
+      wolfSSL_UseSNI(reinterpret_cast<WOLFSSL*>(ssl_), WOLFSSL_SNI_HOST_NAME,
+                     host_.c_str(), static_cast<word16>(host_.size()));
+#else
       SSL_set_tlsext_host_name(ssl_, host_.c_str());
+#endif
       if (verify_peer_) SSL_set1_host(ssl_, host_.c_str());
       return true;
     }
@@ -339,12 +382,13 @@ namespace llnet
         int w = BIO_write(bio_r_, raw_buf_, static_cast<int>(raw_len_));
         if (w > 0) { raw_len_ -= w; if (raw_len_) std::memmove(raw_buf_, raw_buf_ + w, raw_len_); }
       }
-      char tmp[16384];
+      // Drain TLS output BIO directly into send_buf_ — no intermediate copy.
       int p;
       while ((p = BIO_pending(bio_w_)) > 0 && send_len_ < kSendCap)
       {
-        int r = BIO_read(bio_w_, tmp, std::min<int>(p, std::min<int>((int)sizeof(tmp), (int)(kSendCap - send_len_))));
-        if (r > 0) { std::memcpy(send_buf_ + send_len_, tmp, r); send_len_ += r; }
+        int r = BIO_read(bio_w_, send_buf_ + send_len_, std::min(p, (int)(kSendCap - send_len_)));
+        if (r > 0) send_len_ += r;
+        else break;
       }
     }
 
@@ -359,17 +403,18 @@ namespace llnet
       return TlsWriteResult::Error;
     }
 
+    // Drain the overflow queue (only populated on WANT_WRITE — rare).
     bool flush_plain_send()
     {
-      while (plain_off_ < plain_buf_.size())
+      while (plain_off_ < plain_len_)
       {
         size_t wrote = 0;
-        auto result = tls_write_some(plain_buf_.data() + plain_off_, plain_buf_.size() - plain_off_, wrote);
+        auto result = tls_write_some(plain_buf_ + plain_off_, plain_len_ - plain_off_, wrote);
         plain_off_ += wrote;
         if (result == TlsWriteResult::Error) return false;
         if (result == TlsWriteResult::Want)  break;
       }
-      if (plain_off_ == plain_buf_.size()) { plain_buf_.clear(); plain_off_ = 0; }
+      if (plain_off_ == plain_len_) { plain_len_ = 0; plain_off_ = 0; }
       return true;
     }
 
@@ -380,9 +425,9 @@ namespace llnet
       while (raw_len_ < kRawCap)
       {
         ssize_t n = ::recv(sockfd_, raw_buf_ + raw_len_, kRawCap - raw_len_, 0);
-        if (n > 0)      { raw_len_ += n; }
-        else if (n == 0){ cleanup_conn(); if (on_disc_) on_disc_(); return; }
-        else             break;
+        if (n > 0)       { raw_len_ += n; }
+        else if (n == 0) { cleanup_conn(); if (on_disc_) on_disc_(); return; }
+        else              break;
       }
     }
 
@@ -492,12 +537,15 @@ namespace llnet
     sockaddr_storage peer_addr_{};
     socklen_t        peer_addr_len_{};
 
-    char*  recv_buf_ = nullptr;
-    char*  send_buf_ = nullptr;
-    char*  raw_buf_  = nullptr;
+    // recv_buf_: decrypted inbound data.  send_buf_: ciphertext ready to send.
+    // raw_buf_:  raw ciphertext from recv().  plain_buf_: overflow queue for
+    // send_raw() when SSL returns WANT_WRITE (very rare on memory-BIO setups).
+    char*  recv_buf_  = nullptr;
+    char*  send_buf_  = nullptr;
+    char*  raw_buf_   = nullptr;
+    char*  plain_buf_ = nullptr;
     size_t recv_len_ = 0, send_len_ = 0, send_off_ = 0, raw_len_ = 0;
-    std::vector<char> plain_buf_;
-    size_t plain_off_ = 0;
+    size_t plain_len_ = 0, plain_off_ = 0;
 
     ConnCb on_connect_;
     DataCb on_data_;

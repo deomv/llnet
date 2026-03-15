@@ -55,6 +55,7 @@ namespace llnet
 
     void register_fd(int fd, uint32_t events, FdCb cb)
     {
+      if (epoll_fd_ < 0) return;
       fd_handlers_[fd] = std::move(cb);
       epoll_event ev{events, {.fd = fd}};
       if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0)
@@ -67,6 +68,7 @@ namespace llnet
 
     void unregister_fd(int fd)
     {
+      if (epoll_fd_ < 0) { fd_handlers_.erase(fd); return; }
       if (::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) < 0)
       {
         char buf[128];
